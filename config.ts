@@ -189,7 +189,20 @@ export function loadMcpConfig(overridePath?: string, cwd = process.cwd()): McpCo
     config = mergeConfigs(config, expandImports(loaded, cwd));
   }
 
-  return config;
+  const rawServerNames = process.env.MCP_SERVERS;
+  if (rawServerNames === undefined) return config;
+
+  const serverNames = new Set(
+    rawServerNames === "__none__"
+      ? []
+      : rawServerNames.split(",").map((name) => name.trim()).filter(Boolean),
+  );
+  return {
+    ...config,
+    mcpServers: Object.fromEntries(
+      Object.entries(config.mcpServers).filter(([name]) => serverNames.has(name)),
+    ),
+  };
 }
 
 function getConfigSources(overridePath?: string, cwd = process.cwd()): ConfigSourceSpec[] {

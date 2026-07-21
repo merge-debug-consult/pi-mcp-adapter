@@ -11,14 +11,21 @@ function writeJson(path: string, value: unknown): void {
 describe("config discovery", () => {
   const originalHome = process.env.HOME;
   const originalCwd = process.cwd();
+  const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
+  const originalMcpServers = process.env.MCP_SERVERS;
 
   beforeEach(() => {
     vi.resetModules();
+    delete process.env.MCP_SERVERS;
   });
 
   afterEach(() => {
     process.env.HOME = originalHome;
     process.chdir(originalCwd);
+    if (originalAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = originalAgentDir;
+    if (originalMcpServers === undefined) delete process.env.MCP_SERVERS;
+    else process.env.MCP_SERVERS = originalMcpServers;
   });
 
   it("loads standard MCP files first, then Pi overrides", async () => {
@@ -75,6 +82,71 @@ describe("config discovery", () => {
       directTools: true,
       autoAuth: true,
     });
+  });
+
+  it("keeps all merged servers when MCP_SERVERS is omitted", async () => {
+    const home = mkdtempSync(join(tmpdir(), "pi-mcp-filter-all-home-"));
+    const project = mkdtempSync(join(tmpdir(), "pi-mcp-filter-all-project-"));
+    process.env.HOME = home;
+    process.env.PI_CODING_AGENT_DIR = join(home, ".pi", "agent");
+    process.chdir(project);
+
+    writeJson(join(home, ".pi", "agent", "mcp.json"), {
+      mcpServers: {
+        notion: { command: "notion" },
+        linear: { command: "linear" },
+        playwright: { command: "playwright" },
+      },
+    });
+
+    const { loadMcpConfig } = await import("../config.ts");
+    expect(Object.keys(loadMcpConfig().mcpServers)).toEqual(["notion", "linear", "playwright"]);
+  });
+
+  it("filters merged servers through MCP_SERVERS when requested", async () => {
+    const home = mkdtempSync(join(tmpdir(), "pi-mcp-filter-home-"));
+    const project = mkdtempSync(join(tmpdir(), "pi-mcp-filter-project-"));
+    process.env.HOME = home;
+    process.env.PI_CODING_AGENT_DIR = join(home, ".pi", "agent");
+    process.env.MCP_SERVERS = " notion, playwright ";
+    process.chdir(project);
+
+    writeJson(join(home, ".pi", "agent", "mcp.json"), {
+      settings: { toolPrefix: "short" },
+      mcpServers: {
+        notion: { command: "notion" },
+        linear: { command: "linear" },
+        playwright: { command: "playwright" },
+      },
+    });
+
+    const { loadMcpConfig } = await import("../config.ts");
+    const config = loadMcpConfig();
+
+    expect(config.settings).toEqual({ toolPrefix: "short" });
+    expect(config.mcpServers).toEqual({
+      notion: { command: "notion" },
+      playwright: { command: "playwright" },
+    });
+  });
+
+  it("loads no servers when MCP_SERVERS is __none__", async () => {
+    const home = mkdtempSync(join(tmpdir(), "pi-mcp-filter-none-home-"));
+    const project = mkdtempSync(join(tmpdir(), "pi-mcp-filter-none-project-"));
+    process.env.HOME = home;
+    process.env.PI_CODING_AGENT_DIR = join(home, ".pi", "agent");
+    process.env.MCP_SERVERS = "__none__";
+    process.chdir(project);
+
+    writeJson(join(home, ".pi", "agent", "mcp.json"), {
+      mcpServers: {
+        notion: { command: "notion" },
+        linear: { command: "linear" },
+      },
+    });
+
+    const { loadMcpConfig } = await import("../config.ts");
+    expect(loadMcpConfig().mcpServers).toEqual({});
   });
 
   it("prefers modern Claude Code config detection over legacy paths", async () => {

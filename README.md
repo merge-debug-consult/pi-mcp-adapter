@@ -200,6 +200,16 @@ You can also pass only the `code` query parameter with `args: '{"code":"..."}'`.
 
 Per-server `idleTimeout` and `requestTimeoutMs` override the global settings.
 
+### Process-level server filter
+
+Set `MCP_SERVERS` for a child Pi process to restrict the adapter to exact configured server names:
+
+```bash
+MCP_SERVERS=notion,playwright pi
+```
+
+Omit the variable to load all configured servers. Set it to `__none__` to load none. This filters servers after global, project, and imported configuration has been merged; it does not modify configuration files.
+
 ### Output Guard
 
 Oversized MCP tool/resource results are guarded by default so a single huge response can't blow up the model context window or the session file:

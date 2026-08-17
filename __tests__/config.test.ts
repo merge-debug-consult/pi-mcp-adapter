@@ -1,7 +1,15 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { mkdtempSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join, normalize, resolve } from "node:path";
 import { tmpdir } from "node:os";
+
+vi.mock("node:os", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:os")>();
+  return {
+    ...actual,
+    homedir: (): string => process.env.HOME ?? actual.homedir(),
+  };
+});
 
 function writeJson(path: string, value: unknown): void {
   mkdirSync(dirname(path), { recursive: true });
@@ -10,6 +18,7 @@ function writeJson(path: string, value: unknown): void {
 
 describe("config discovery", () => {
   const originalHome = process.env.HOME;
+  const originalPackageDir = process.env.PI_PACKAGE_DIR;
   const originalCwd = process.cwd();
   const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
   const originalMcpServers = process.env.MCP_SERVERS;
@@ -21,6 +30,11 @@ describe("config discovery", () => {
 
   afterEach(() => {
     process.env.HOME = originalHome;
+    if (originalPackageDir === undefined) {
+      delete process.env.PI_PACKAGE_DIR;
+    } else {
+      process.env.PI_PACKAGE_DIR = originalPackageDir;
+    }
     process.chdir(originalCwd);
     if (originalAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
     else process.env.PI_CODING_AGENT_DIR = originalAgentDir;
@@ -88,12 +102,18 @@ describe("config discovery", () => {
     const config = loadMcpConfig();
     const realPlugin = realpathSync(plugin);
     const pluginDataDir = join(home, ".pi", "agent", "agent-plugin-data", "acme.tools");
+    const localServer = config.mcpServers.acme_tools__local;
+    expect(localServer.args?.map((value) => value.startsWith("--") ? value : normalize(value))).toEqual([
+      "--config",
+      join(realPlugin, "config.json"),
+      "--data",
+      join(pluginDataDir, "local"),
+    ]);
+    expect(normalize(localServer.env?.CACHE ?? "")).toBe(join(pluginDataDir, "cache"));
     expect(config.mcpServers).toMatchObject({
       acme_tools__local: {
         command: join(realPlugin, "bin", "server"),
-        args: ["--config", join(realPlugin, "config.json"), "--data", join(pluginDataDir, "local")],
         env: {
-          CACHE: join(pluginDataDir, "cache"),
           LITERAL_HOME: "${HOME}",
           LITERAL_COMMAND: "!echo pwned",
           PLUGIN_ROOT: realPlugin,
@@ -304,6 +324,28 @@ describe("config discovery", () => {
 
     const { loadMcpConfig } = await import("../config.ts");
     expect(loadMcpConfig().mcpServers).toEqual({});
+  });
+
+  it("loads the branded project Pi override path", async () => {
+    const home = mkdtempSync(join(tmpdir(), "pi-mcp-config-branded-home-"));
+    const packageDir = mkdtempSync(join(tmpdir(), "pi-mcp-config-branded-package-"));
+    const project = mkdtempSync(join(tmpdir(), "pi-mcp-config-branded-project-"));
+    process.env.HOME = home;
+    process.env.PI_PACKAGE_DIR = packageDir;
+    process.chdir(project);
+
+    writeJson(join(packageDir, "package.json"), { piConfig: { name: "arc", configDir: ".arc" } });
+    writeJson(join(project, ".arc", "mcp.json"), {
+      mcpServers: {
+        brandedProject: { command: "branded" },
+      },
+    });
+
+    const { getProjectPiConfigPath, loadMcpConfig } = await import("../config.ts");
+    const config = loadMcpConfig();
+
+    expect(getProjectPiConfigPath(project)).toBe(join(project, ".arc", "mcp.json"));
+    expect(config.mcpServers.brandedProject).toMatchObject({ command: "branded" });
   });
 
   it("replaces transport-specific fields when an override switches to or from a socket", async () => {
@@ -944,6 +986,25 @@ describe("config discovery", () => {
     expect(JSON.stringify(entry)).not.toContain("secret-bearer-token");
   });
 
+  it("drops an inherited request headers command when a url-only override repoints the server", async () => {
+    const home = mkdtempSync(join(tmpdir(), "pi-mcp-urlauth-rhc-home-"));
+    const project = mkdtempSync(join(tmpdir(), "pi-mcp-urlauth-rhc-project-"));
+    writeBakedAndOverride(
+      home,
+      project,
+      { url: URL_A, requestHeadersCommand: { command: "sign-old-url", args: ["${REQUEST_SECRET}"] } },
+      { url: URL_B },
+    );
+
+    const { loadMcpConfig } = await import("../config.ts");
+    const config = loadMcpConfig();
+
+    const entry = config.mcpServers.litellm;
+    expect(entry).toEqual({ url: URL_B });
+    expect(entry.requestHeadersCommand).toBeUndefined();
+    expect(JSON.stringify(entry)).not.toContain("REQUEST_SECRET");
+  });
+
   it("drops inherited oauth config when a url-only override repoints the server", async () => {
     const home = mkdtempSync(join(tmpdir(), "pi-mcp-urlauth-oauth-home-"));
     const project = mkdtempSync(join(tmpdir(), "pi-mcp-urlauth-oauth-project-"));
@@ -1178,7 +1239,7 @@ describe("config discovery", () => {
     } = await import("../config.ts");
 
     const importsPreview = previewCompatibilityImports(["cursor", "codex"]);
-    expect(importsPreview.path).toContain(".pi/agent/mcp.json");
+    expect(importsPreview.path).toBe(join(home, ".pi", "agent", "mcp.json"));
     expect(importsPreview.changed).toBe(true);
     expect(importsPreview.diffText).toContain("+++ after");
     expect(importsPreview.diffText).toContain('+     "codex"');

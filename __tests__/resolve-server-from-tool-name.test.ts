@@ -2,7 +2,13 @@ import { describe, expect, it } from "vitest";
 import {
 	resolveServerFromToolName,
 	getServerPrefix,
+	formatPromptCommandName,
 	formatToolName,
+	createToolSelectorCandidateIndex,
+	getToolNameCandidates,
+	isToolExcluded,
+	isToolAllowed,
+	matchesToolPattern,
 } from "../types.ts";
 
 describe("resolveServerFromToolName", () => {
@@ -24,6 +30,29 @@ describe("resolveServerFromToolName", () => {
 			);
 		});
 
+		it("round-trips server names with spaces", () => {
+			const tool = formatToolName("web_search", "my server", "server");
+			expect(tool).toBe("my_20_server_web_search");
+			expect(resolveServerFromToolName(tool, ["my server"], "server")).toBe(
+				"my server",
+			);
+		});
+
+		it("keeps colliding sanitized server names distinct across mappings", () => {
+			const spacedTool = formatToolName("search", "my server", "server");
+			const underscoredTool = formatToolName("search", "my_server", "server");
+
+			expect(spacedTool).toBe("my_20_server_search");
+			expect(underscoredTool).toBe("my_server_search");
+			expect(new Set([spacedTool, underscoredTool]).size).toBe(2);
+			expect(resolveServerFromToolName(spacedTool, ["my server", "my_server"], "server")).toBe("my server");
+			expect(resolveServerFromToolName(underscoredTool, ["my server", "my_server"], "server")).toBe("my_server");
+			expect(formatPromptCommandName("plan", "my server", "server")).toBe("mcp__my_20_server__plan");
+			expect(formatPromptCommandName("plan", "my_server", "server")).toBe("mcp__my_server__plan");
+			expect(getToolNameCandidates("search", "my server", "server")).toContain(spacedTool);
+			expect(getToolNameCandidates("search", "my_server", "server")).toContain(underscoredTool);
+		});
+
 		it("resolves when multiple servers are configured and only one prefix matches", () => {
 			expect(
 				resolveServerFromToolName(
@@ -35,8 +64,7 @@ describe("resolveServerFromToolName", () => {
 		});
 
 		it("picks the longest matching prefix when server names share a stem", () => {
-			// "searxng" (prefix "searxng", len 7) vs "searxng-extra" (prefix "searxng_extra", len 13)
-			const tool = "searxng_extra_deep_search";
+			const tool = "searxng-extra_deep_search";
 			expect(
 				resolveServerFromToolName(tool, ["searxng", "searxng-extra"], "server"),
 			).toBe("searxng-extra");
@@ -60,13 +88,16 @@ describe("resolveServerFromToolName", () => {
 				"-mcp",
 			);
 		});
+
+		it("fails safe when suffix removal creates an ambiguous prefix", () => {
+			expect(resolveServerFromToolName("foo_query", ["foo", "foo-mcp"], "short")).toBeUndefined();
+		});
 	});
 
 	describe("mcp prefix mode", () => {
 		it("resolves the mcp__namespaced format", () => {
-			// getServerPrefix replaces dashes with underscores: my-server -> mcp__my_server
 			expect(
-				resolveServerFromToolName("mcp__my_server_run", ["my-server"], "mcp"),
+				resolveServerFromToolName("mcp__my-server_run", ["my-server"], "mcp"),
 			).toBe("my-server");
 		});
 	});
@@ -146,56 +177,73 @@ describe("resolveServerFromToolName", () => {
 	});
 });
 
-describe("ambiguous prefix collisions (fail safe)", () => {
-	it("returns undefined when two servers normalize to the same prefix", () => {
-		// my-server and my_server both -> my_server under "server" mode
-		expect(
-			resolveServerFromToolName("my_server_run", ["my-server", "my_server"], "server"),
-		).toBe(undefined);
+describe("direct tool selector candidates", () => {
+	it("keeps hyphen and underscore prefixes distinct while matching legacy escaped prefixes", () => {
+		const hyphenCandidates = getToolNameCandidates("do_thing", "my-server", "server");
+		const underscoreCandidates = getToolNameCandidates("do_thing", "my_server", "server");
+
+		expect(matchesToolPattern(hyphenCandidates, ["my-server_do_thing"])).toBe(true);
+		expect(matchesToolPattern(hyphenCandidates, ["my_server_do_thing"])).toBe(true);
+		expect(matchesToolPattern(underscoreCandidates, ["my-server_do_thing"])).toBe(false);
+		expect(matchesToolPattern(hyphenCandidates, ["my_2d_server_do_thing"])).toBe(true);
 	});
 
-	it("returns undefined regardless of collision order", () => {
-		expect(
-			resolveServerFromToolName("my_server_run", ["my_server", "my-server"], "server"),
-		).toBe(undefined);
+	it("matches normalized legacy emitted selectors when they are safe", () => {
+		expect(isToolExcluded("do_thing", "my-server", "server", ["my_server_do_thing"], new Set())).toBe(true);
+		expect(isToolAllowed("do_thing", "my-server", "server", undefined, ["my_server_do_thing"], new Set())).toBe(false);
+		expect(isToolExcluded("do_thing", "my-server", "server", ["my_2d_server_do_thing"], new Set())).toBe(true);
+		expect(isToolExcluded("do_thing", "my-server", "server", ["my-server_do_thing"], new Set())).toBe(true);
 	});
 
-	it("does not false-trigger on a single server whose name contains a dash", () => {
-		// Only one configured server, no collision: dashes are fine.
+	it("does not apply normalized legacy emitted selectors through indexed exact collisions", () => {
+		const emptyIndex = createToolSelectorCandidateIndex(new Set());
+		const collisionIndex = createToolSelectorCandidateIndex(new Set(["my_server_do_thing"]));
+
+		expect(isToolExcluded("do-thing", "my-server", "server", ["my_server_do_thing"], emptyIndex)).toBe(true);
+		expect(isToolExcluded("do-thing", "my-server", "server", ["my_server_do_thing"], collisionIndex)).toBe(false);
+	});
+
+	it("skips indexed collision work when excludes are empty", () => {
+		const index = createToolSelectorCandidateIndex(new Set(["my_server_do_other"]));
+
+		expect(isToolExcluded("do-thing", "my-server", "server", undefined, index)).toBe(false);
+		expect(isToolExcluded("do-thing", "my-server", "server", [], index)).toBe(false);
+		expect(index.matchingCountByPattern.size).toBe(0);
+		expect(index.matcherByPattern.size).toBe(0);
+	});
+
+	it("caches indexed glob collision counts and matchers", () => {
+		const index = createToolSelectorCandidateIndex(new Set(["my_server_do_other", "unrelated"]));
+
+		expect(isToolExcluded("do-thing", "my-server", "server", ["my_server_do_*"], index)).toBe(false);
+		expect(isToolExcluded("do-thing", "my-server", "server", ["my_server_do_*"], index)).toBe(false);
+		expect(index.matchingCountByPattern).toEqual(new Map([["my_server_do_*", 1]]));
+		expect(index.matcherByPattern.size).toBe(1);
+
+		const currentOnlyIndex = createToolSelectorCandidateIndex(
+			getToolNameCandidates("do-thing", "my-server", "server", false),
+		);
+		expect(isToolExcluded("do-thing", "my-server", "server", ["my_server_do_*"], currentOnlyIndex)).toBe(true);
+		expect(currentOnlyIndex.matcherByPattern.size).toBe(1);
+	});
+});
+
+describe("distinct normalized server prefixes", () => {
+	it("resolves distinct space and hyphen prefixes", () => {
 		expect(
-			resolveServerFromToolName("my_server_run", ["my-server"], "server"),
+			resolveServerFromToolName("a_20_b_run", ["a b", "a-20-b"], "server"),
+		).toBe("a b");
+		expect(
+			resolveServerFromToolName("a-20-b_run", ["a b", "a-20-b"], "server"),
+		).toBe("a-20-b");
+	});
+
+	it("resolves distinct hyphen and underscore prefixes under mcp mode", () => {
+		expect(
+			resolveServerFromToolName("mcp__my-server_run", ["my-server", "my_server"], "mcp"),
 		).toBe("my-server");
-	});
-
-	it("returns undefined when a collision happens under mcp mode too", () => {
-		// both -> mcp__my_server
 		expect(
-			resolveServerFromToolName(
-				"mcp__my_server_run",
-				["my-server", "my_server"],
-				"mcp",
-			),
-		).toBe(undefined);
-	});
-
-	it("still resolves when the colliding servers are unrelated to the call", () => {
-		// colliding my-server/my_server exist, but the call targets searxng.
-		expect(
-			resolveServerFromToolName(
-				"searxng_search",
-				["my-server", "my_server", "searxng"],
-				"server",
-			),
-		).toBe("searxng");
-	});
-
-	it("is deterministic: a collision between only two of many servers still fails safe", () => {
-		expect(
-			resolveServerFromToolName(
-				"my_server_run",
-				["searxng", "my-server", "my_server", "github"],
-				"server",
-			),
-		).toBe(undefined);
+			resolveServerFromToolName("mcp__my_server_run", ["my-server", "my_server"], "mcp"),
+		).toBe("my_server");
 	});
 });

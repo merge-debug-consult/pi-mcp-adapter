@@ -14,11 +14,12 @@ import { logger } from "./logger.ts";
 import { executeAuthComplete, executeAuthStart, executeCall, executeConnect, executeDescribe, executeInstructions, executeList, executeSearch, executeStatus, executeUiMessages } from "./proxy-modes.ts";
 import { formatTerminalError, getConfigPathFromArgv, normalizeDirectToolInputSchema, truncateAtWord } from "./utils.ts";
 import { createOAuthRuntime, shutdownOAuth } from "./mcp-auth-flow.ts";
-import { createMcpDirectToolCallRenderer, renderMcpProxyToolCall, renderMcpToolResult } from "./tool-result-renderer.ts";
+import { createMcpDirectToolCallRenderer, createMcpProxyToolCallRenderer, createMcpToolResultRenderer, resolveMcpToolRenderOptions } from "./tool-result-renderer.ts";
 import { toolErrorOverride } from "./error-signal.ts";
 import { createMcpRuntimeOwner, createOwnedUi, isAbortError, type McpRuntimeOwner } from "./runtime-owner.ts";
 import { publishMcpStatusShutdown } from "./mcp-status.ts";
 import { runMcpScript } from "./mcp-code.ts";
+import { cleanupMaterializedBinaryResources } from "./tool-registrar.ts";
 
 export type { McpAdapterOptions } from "./types.ts";
 export {
@@ -123,6 +124,9 @@ function installMcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions) {
   const envDirectToolOverride = envRaw?.split(",").map(s => s.trim()).filter(Boolean);
   const registeredDirectTools = new Map<string, string>();
   const fallbackDeactivatedTools = new Set<string>();
+  const toolRenderOptions = resolveMcpToolRenderOptions(earlyConfig.settings);
+  const toolRenderShell = toolRenderOptions.resultRendering === "compact" ? "self" : "default";
+  const renderMcpToolResult = createMcpToolResultRenderer(toolRenderOptions);
   let proxyToolRegistered = false;
   let proxyToolDescription: string | null = null;
   let directToolsFrozen = false;
@@ -157,7 +161,8 @@ function installMcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions) {
       promptSnippet: truncateAtWord(spec.description, 100) || `MCP tool from ${spec.serverName}`,
       parameters: toToolParameters(normalizeDirectToolInputSchema(spec.inputSchema)),
       execute: createDirectToolExecutor(() => state, () => initPromise, spec),
-      renderCall: createMcpDirectToolCallRenderer(spec.prefixedName),
+      renderShell: toolRenderShell,
+      renderCall: createMcpDirectToolCallRenderer(spec.prefixedName, toolRenderOptions),
       renderResult: renderMcpToolResult,
     });
   }
@@ -168,13 +173,23 @@ function installMcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions) {
     return resolveDirectTools(config, cache, prefix, envDirectToolOverride);
   }
 
+  function getActiveToolsIfReady(): string[] | undefined {
+    try {
+      return pi.getActiveTools?.();
+    } catch (error) {
+      if (error instanceof Error
+        && error.message.includes("Action methods cannot be called during extension loading")) return undefined;
+      throw error;
+    }
+  }
+
   function deactivateTools(toolNames: string[]): string[] {
     if (toolNames.length === 0) return [];
     const unregisterTool = (pi as ExtensionAPI & { unregisterTool?: (name: string) => boolean }).unregisterTool;
     const unregistered = toolNames.filter((toolName) => unregisterTool?.(toolName) === true);
     const fallbackNames = toolNames.filter((toolName) => !unregistered.includes(toolName));
     const remove = new Set(toolNames);
-    const activeTools = pi.getActiveTools?.();
+    const activeTools = getActiveToolsIfReady();
     if (!activeTools || activeTools.length === 0) {
       for (const toolName of fallbackNames) fallbackDeactivatedTools.add(toolName);
       return unregistered;
@@ -206,7 +221,7 @@ function installMcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions) {
         registerDirectTool(spec);
         registeredDirectTools.set(spec.prefixedName, fingerprint);
         if (fallbackDeactivatedTools.delete(spec.prefixedName)) {
-          const activeTools = pi.getActiveTools?.();
+          const activeTools = getActiveToolsIfReady();
           if (activeTools && !activeTools.includes(spec.prefixedName)) {
             pi.setActiveTools([...activeTools, spec.prefixedName]);
           }
@@ -275,6 +290,7 @@ function installMcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions) {
   });
 
   function startInitialization(ctx: ExtensionContext, owner: McpRuntimeOwner, oauthRuntime: McpOAuthRuntime, generation: number, staleReason: string): Promise<void> {
+    owner.addCleanup(() => cleanupMaterializedBinaryResources(owner.signal));
     const promise = initializeMcp(pi, ctx, owner, {
       ...(programmaticConfig || options.configPath !== undefined
         ? {
@@ -683,7 +699,8 @@ function installMcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions) {
       label: "MCP",
       description,
       promptSnippet: "MCP gateway — status, search, describe, auth, and single MCP tool calls",
-      renderCall: renderMcpProxyToolCall,
+      renderShell: toolRenderShell,
+      renderCall: createMcpProxyToolCallRenderer(toolRenderOptions),
       parameters: Type.Object({
         tool: Type.Optional(Type.String({ description: "Tool name to call (e.g., 'xcodebuild_list_sims')" })),
         args: Type.Optional(Type.Union([
@@ -720,12 +737,12 @@ function installMcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions) {
         action?: string;
       }, signal: AbortSignal | undefined, _onUpdate: AgentToolUpdateCallback<Record<string, unknown>> | undefined, _ctx: ExtensionContext) {
         const executeOwner = currentOwner;
-        let parsedArgs: Record<string, unknown> | undefined;
-        if (params.args !== undefined && params.args !== "") {
+        const parseArgs = (value: string | Record<string, unknown> | undefined): Record<string, unknown> | undefined => {
+          if (value === undefined || value === "") return undefined;
           let args: unknown;
-          if (typeof params.args === "string") {
+          if (typeof value === "string") {
             try {
-              args = JSON.parse(params.args);
+              args = JSON.parse(value);
             } catch (error) {
               if (error instanceof SyntaxError) {
                 throw new Error(`Invalid args JSON: ${error.message}`, { cause: error });
@@ -733,14 +750,35 @@ function installMcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions) {
               throw error;
             }
           } else {
-            args = params.args;
+            args = value;
           }
 
           if (typeof args !== "object" || args === null || Array.isArray(args)) {
             const gotType = Array.isArray(args) ? "array" : args === null ? "null" : typeof args;
             throw new Error(`Invalid args: expected a JSON object, got ${gotType}`);
           }
-          parsedArgs = args as Record<string, unknown>;
+          return args as Record<string, unknown>;
+        };
+        let parsedArgs = parseArgs(params.args);
+        let dispatchParams = params;
+        const hasGatewayMode = (value: typeof params): boolean =>
+          value.tool !== undefined
+          || value.connect !== undefined
+          || value.describe !== undefined
+          || value.instructions !== undefined
+          || value.search !== undefined
+          || value.server !== undefined
+          || value.action !== undefined;
+        if (!hasGatewayMode(params) && parsedArgs) {
+          const nestedParams = parsedArgs as typeof params;
+          if (hasGatewayMode(nestedParams)) {
+            dispatchParams = nestedParams;
+            parsedArgs = parseArgs(nestedParams.args);
+          } else {
+            throw new Error("Gateway params were nested inside `args`; pass them top-level (for example, mcp({ search: \"...\" }) or mcp({ tool: \"...\", args: {} })).");
+          }
+        } else if (!hasGatewayMode(params) && params.args !== undefined) {
+          throw new Error("Gateway params were nested inside `args`; pass them top-level (for example, mcp({ search: \"...\" }) or mcp({ tool: \"...\", args: {} })).");
         }
 
         if (!state && initPromise) {
@@ -771,22 +809,22 @@ function installMcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions) {
         }
         executeOwner?.throwIfInactive();
 
-        if (params.action === "ui-messages") {
+        if (dispatchParams.action === "ui-messages") {
           return executeUiMessages(state);
         }
-        if (params.action === "auth-start") {
-          if (!params.server) {
+        if (dispatchParams.action === "auth-start") {
+          if (!dispatchParams.server) {
             return {
               content: [{ type: "text" as const, text: "auth-start requires `server`. Example: mcp({ action: \"auth-start\", server: \"linear-server\" })" }],
               details: { mode: "auth-start", error: "missing_server" },
             };
           }
           return signal
-            ? executeAuthStart(state, params.server, signal)
-            : executeAuthStart(state, params.server);
+            ? executeAuthStart(state, dispatchParams.server, signal)
+            : executeAuthStart(state, dispatchParams.server);
         }
-        if (params.action === "auth-complete") {
-          if (!params.server) {
+        if (dispatchParams.action === "auth-complete") {
+          if (!dispatchParams.server) {
             return {
               content: [{ type: "text" as const, text: "auth-complete requires `server`." }],
               details: { mode: "auth-complete", error: "missing_server" },
@@ -800,28 +838,28 @@ function installMcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions) {
             };
           }
           return signal
-            ? executeAuthComplete(state, params.server, input, signal)
-            : executeAuthComplete(state, params.server, input);
+            ? executeAuthComplete(state, dispatchParams.server, input, signal)
+            : executeAuthComplete(state, dispatchParams.server, input);
         }
-        if (params.tool) {
-          return executeCall(state, params.tool, parsedArgs, params.server, getPiTools, signal);
+        if (dispatchParams.tool) {
+          return executeCall(state, dispatchParams.tool, parsedArgs, dispatchParams.server, getPiTools, signal);
         }
-        if (params.connect) {
-          const result = await executeConnect(state, params.connect, signal);
+        if (dispatchParams.connect) {
+          const result = await executeConnect(state, dispatchParams.connect, signal);
           syncToolSurface(_ctx as ExtensionContext);
           return result;
         }
-        if (params.describe) {
-          return executeDescribe(state, params.describe);
+        if (dispatchParams.describe) {
+          return executeDescribe(state, dispatchParams.describe);
         }
-        if (params.instructions) {
-          return executeInstructions(state, params.instructions);
+        if (dispatchParams.instructions) {
+          return executeInstructions(state, dispatchParams.instructions);
         }
-        if (params.search !== undefined) {
-          return executeSearch(state, params.search, params.regex, params.server, params.includeSchemas, params.limit, params.offset);
+        if (dispatchParams.search !== undefined) {
+          return executeSearch(state, dispatchParams.search, dispatchParams.regex, dispatchParams.server, dispatchParams.includeSchemas, dispatchParams.limit, dispatchParams.offset);
         }
-        if (params.server) {
-          return executeList(state, params.server);
+        if (dispatchParams.server) {
+          return executeList(state, dispatchParams.server);
         }
         return executeStatus(state);
       },
@@ -847,7 +885,7 @@ function installMcpAdapter(pi: ExtensionAPI, options: McpAdapterOptions) {
         registerProxyTool(description);
         return;
       }
-      const activeTools = pi.getActiveTools?.();
+      const activeTools = getActiveToolsIfReady();
       if (activeTools && !activeTools.includes("mcp")) {
         pi.setActiveTools([...activeTools, "mcp"]);
       }

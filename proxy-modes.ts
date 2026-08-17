@@ -10,17 +10,18 @@ import { combineAbortSignals, isAbortError } from "./runtime-owner.ts";
 import { buildToolMetadata, getToolNames, findToolByName, formatSchema } from "./tool-metadata.ts";
 import { renderTsShape } from "./ts-shape.ts";
 import { reconstructPromptMetadata } from "./metadata-cache.ts";
-import { resolveMcpResultContent, transformMcpContent } from "./tool-registrar.ts";
+import { resolveMcpResultContent, transformMcpContent, transformMcpResourceContents } from "./tool-registrar.ts";
 import { guardMcpOutput, guardedMcpDetails, resolveMcpOutputGuardOptions } from "./mcp-output-guard.ts";
 import { maybeStartUiSession, summarizeUiSessionResult, type UiSessionRuntime } from "./ui-session.ts";
 import { formatAuthRequiredMessage, formatMcpStatus, resolveServerUrl, truncateAtWord } from "./utils.ts";
 import { authenticate, completeAuthFromInput, startAuth, supportsOAuth } from "./mcp-auth-flow.ts";
 import { SessionRecoveryAuthRequiredError, withSessionRecovery } from "./session-recovery.ts";
-import { paginate, rankSuggestions, rankToolMatches } from "./search-ranking.ts";
+import { paginate, rankSuggestions, rankToolMatches, resolveSearchKeywords } from "./search-ranking.ts";
 import { ensureToolCallApproved, isToolCallApprovalRequired } from "./tool-approval.ts";
 
 type ProxyToolResult = AgentToolResult<Record<string, unknown>>;
 type ClientCallToolResult = Awaited<ReturnType<Client["callTool"]>>;
+type ClientReadResourceResult = Awaited<ReturnType<Client["readResource"]>>;
 
 const require = createRequire(import.meta.url);
 const MAX_REGEX_SEARCH_QUERY_LENGTH = 256;
@@ -35,6 +36,36 @@ type AutoAuthResult =
   | { status: "skipped" }
   | { status: "success" }
   | { status: "failed"; message: string };
+
+function getToolMatches(metadata: ToolMetadata[] | undefined, toolName: string, exact: boolean): ToolMetadata[] {
+  if (!metadata) return [];
+  if (exact) return metadata.filter(tool => tool.name === toolName);
+  const normalizedName = toolName.replace(/-/g, "_");
+  return metadata.filter(tool => tool.name.replace(/-/g, "_") === normalizedName);
+}
+
+function getEnabledToolMatches(state: McpExtensionState, toolName: string, exact: boolean): { server: string; tool: ToolMetadata }[] {
+  const matches: { server: string; tool: ToolMetadata }[] = [];
+  for (const [server, metadata] of state.toolMetadata) {
+    if (isServerDisabled(state.config.mcpServers[server])) continue;
+    for (const tool of getToolMatches(metadata, toolName, exact)) matches.push({ server, tool });
+  }
+  return matches;
+}
+
+function getSingleToolMatch(metadata: ToolMetadata[] | undefined, toolName: string): ToolMetadata | "ambiguous" | undefined {
+  const exactMatches = getToolMatches(metadata, toolName, true);
+  const matches = exactMatches.length > 0 ? exactMatches : getToolMatches(metadata, toolName, false);
+  return matches.length > 1 ? "ambiguous" : matches[0];
+}
+
+function ambiguousToolResult(mode: "call" | "describe", toolName: string): ProxyToolResult {
+  const message = `Tool "${toolName}" matches multiple servers. Specify a server.`;
+  return {
+    content: [{ type: "text" as const, text: message }],
+    details: { mode, error: "ambiguous_tool", requestedTool: toolName, message },
+  };
+}
 
 function disabledResult(mode: string, serverName: string): ProxyToolResult {
   const message = `Server "${serverName}" is disabled. Run /mcp enable ${serverName} and /reload to enable it.`;
@@ -403,20 +434,28 @@ export async function executeAuthComplete(state: McpExtensionState, serverName: 
 }
 
 export function executeDescribe(state: McpExtensionState, toolName: string): ProxyToolResult {
-  let serverName: string | undefined;
-  let toolMeta: ToolMetadata | undefined;
+  const exactMatches = getEnabledToolMatches(state, toolName, true);
+  if (exactMatches.length > 1) return ambiguousToolResult("describe", toolName);
+  if (exactMatches.length === 0 && getEnabledToolMatches(state, toolName, false).length > 1) {
+    return ambiguousToolResult("describe", toolName);
+  }
+
+  let serverName = exactMatches[0]?.server;
+  let toolMeta = exactMatches[0]?.tool;
   let disabledMatch: string | undefined;
 
-  for (const [server, metadata] of state.toolMetadata.entries()) {
-    const found = findToolByName(metadata, toolName);
-    if (!found) continue;
-    if (isServerDisabled(state.config.mcpServers[server])) {
-      disabledMatch ??= server;
-      continue;
+  if (!toolMeta) {
+    for (const [server, metadata] of state.toolMetadata.entries()) {
+      const found = findToolByName(metadata, toolName);
+      if (!found) continue;
+      if (isServerDisabled(state.config.mcpServers[server])) {
+        disabledMatch ??= server;
+        continue;
+      }
+      serverName = server;
+      toolMeta = found;
+      break;
     }
-    serverName = server;
-    toolMeta = found;
-    break;
   }
 
   if (!serverName || !toolMeta) {
@@ -429,7 +468,7 @@ export function executeDescribe(state: McpExtensionState, toolName: string): Pro
     };
   }
 
-  const approvalMarker = isToolCallApprovalRequired(state.config, serverName, toolMeta)
+  const approvalMarker = isToolCallApprovalRequired(state.config, serverName, toolMeta, state.toolMetadata)
     ? " (requires approval)"
     : "";
   let text = `${toolMeta.name}${approvalMarker}\n`;
@@ -502,11 +541,15 @@ export function executeSearch(
     }
 
     matches = [];
+    const globalPrefix = state.config.settings?.toolPrefix ?? "server";
     for (const [serverName, metadata] of state.toolMetadata.entries()) {
-      if (isServerDisabled(state.config.mcpServers[serverName])) continue;
+      const definition = state.config.mcpServers[serverName];
+      if (isServerDisabled(definition)) continue;
       if (server && serverName !== server) continue;
       for (const tool of metadata) {
-        if (pattern.test(tool.name) || pattern.test(tool.description)) matches.push({ server: serverName, tool, score: 0 });
+        const matched = pattern.test(tool.name) || pattern.test(tool.description)
+          || resolveSearchKeywords(definition, tool.originalName, serverName, globalPrefix).some(keyword => pattern.test(keyword));
+        if (matched) matches.push({ server: serverName, tool, score: 0 });
       }
     }
   } else if (query.trim().length === 0) {
@@ -552,7 +595,7 @@ export function executeSearch(
 
   let text = `Found ${page.total} tool${page.total === 1 ? "" : "s"} matching "${query}":\n\n`;
   for (const match of page.items) {
-    const approvalMarker = isToolCallApprovalRequired(state.config, match.server, match.tool)
+    const approvalMarker = isToolCallApprovalRequired(state.config, match.server, match.tool, state.toolMetadata)
       ? " (requires approval)"
       : "";
     if (showSchemas) {
@@ -732,7 +775,7 @@ export async function executeConnect(state: McpExtensionState, serverName: strin
       }
     }
     const prefix = state.config.settings?.toolPrefix ?? "server";
-    const { metadata } = buildToolMetadata(connection.tools, connection.resources, definition, serverName, prefix);
+    const { metadata } = buildToolMetadata(connection.tools, connection.resources, definition, serverName, prefix, state.config.mcpServers, state.toolMetadata);
     state.toolMetadata.set(serverName, metadata);
     if (!connection.promptDiscoveryFailed) {
       state.promptMetadata?.set(serverName, reconstructPromptMetadata(serverName, connection.prompts ?? [], prefix, definition));
@@ -800,14 +843,22 @@ export async function executeCall(
     };
   }
   if (serverName) {
-    toolMeta = findToolByName(state.toolMetadata.get(serverName), toolName);
+    const match = getSingleToolMatch(state.toolMetadata.get(serverName), toolName);
+    if (match === "ambiguous") return ambiguousToolResult("call", toolName);
+    toolMeta = match;
     if (isServerDisabled(state.config.mcpServers[serverName])) {
       return disabledCallResult(serverName, toolMeta);
     }
   } else {
+    const exactMatches = getEnabledToolMatches(state, toolName, true);
+    if (exactMatches.length > 1) return ambiguousToolResult("call", toolName);
+    if (exactMatches.length === 0 && getEnabledToolMatches(state, toolName, false).length > 1) {
+      return ambiguousToolResult("call", toolName);
+    }
+
     let disabledMatch: { serverName: string; toolMeta: ToolMetadata } | undefined;
     for (const [server, metadata] of state.toolMetadata.entries()) {
-      const found = findToolByName(metadata, toolName);
+      const found = metadata.find(tool => tool.name === toolName);
       if (!found) continue;
       if (isServerDisabled(state.config.mcpServers[server])) {
         disabledMatch ??= { serverName: server, toolMeta: found };
@@ -817,13 +868,28 @@ export async function executeCall(
       toolMeta = found;
       break;
     }
+    if (!toolMeta && !disabledMatch) {
+      for (const [server, metadata] of state.toolMetadata.entries()) {
+        const found = findToolByName(metadata, toolName);
+        if (!found) continue;
+        if (isServerDisabled(state.config.mcpServers[server])) {
+          disabledMatch ??= { serverName: server, toolMeta: found };
+          continue;
+        }
+        serverName = server;
+        toolMeta = found;
+        break;
+      }
+    }
     if (!toolMeta && disabledMatch) return disabledCallResult(disabledMatch.serverName, disabledMatch.toolMeta);
   }
 
   if (serverName && !toolMeta) {
     const connected = await lazyConnect(state, serverName, ownedSignal);
     if (connected) {
-      toolMeta = findToolByName(state.toolMetadata.get(serverName), toolName);
+      const match = getSingleToolMatch(state.toolMetadata.get(serverName), toolName);
+      if (match === "ambiguous") return ambiguousToolResult("call", toolName);
+      toolMeta = match;
     } else {
       const needsAuthConnection = state.manager.getConnection(serverName);
       if (needsAuthConnection?.status === "needs-auth") {
@@ -841,7 +907,9 @@ export async function executeCall(
             clearFailure(state, serverName);
             const connectedAfterAuth = await lazyConnect(state, serverName, ownedSignal);
             if (connectedAfterAuth) {
-              toolMeta = findToolByName(state.toolMetadata.get(serverName), toolName);
+              const match = getSingleToolMatch(state.toolMetadata.get(serverName), toolName);
+              if (match === "ambiguous") return ambiguousToolResult("call", toolName);
+              toolMeta = match;
               if (!toolMeta) {
                 const suggestions = rankSuggestions(state, toolName, 5);
                 const suggestionText = suggestions.length > 0 ? ` Did you mean: ${suggestions.join(", ")}` : "";
@@ -878,6 +946,8 @@ export async function executeCall(
   let prefixMatchedServer: string | undefined;
 
   if (!serverName && !toolMeta && prefixMode !== "none") {
+    const lazyExactMatches: { serverName: string; toolMeta: ToolMetadata }[] = [];
+    const lazyFallbackMatches: { serverName: string; toolMeta: ToolMetadata }[] = [];
     const candidates = Object.keys(state.config.mcpServers)
       .filter(name => !isServerDisabled(state.config.mcpServers[name]))
       .map(name => ({ name, prefix: getServerPrefix(name, prefixMode) }))
@@ -908,11 +978,22 @@ export async function executeCall(
 
       if (!connected) continue;
       if (!prefixMatchedServer) prefixMatchedServer = configuredServer;
-      toolMeta = findToolByName(state.toolMetadata.get(configuredServer), toolName);
-      if (toolMeta) {
-        serverName = configuredServer;
-        break;
+      const metadata = state.toolMetadata.get(configuredServer);
+      const exactMatches = getToolMatches(metadata, toolName, true);
+      if (exactMatches.length > 1) return ambiguousToolResult("call", toolName);
+      if (exactMatches.length === 1) {
+        lazyExactMatches.push({ serverName: configuredServer, toolMeta: exactMatches[0]! });
+        continue;
       }
+      const fallbackMatches = getToolMatches(metadata, toolName, false);
+      if (fallbackMatches.length > 1) return ambiguousToolResult("call", toolName);
+      if (fallbackMatches.length === 1) lazyFallbackMatches.push({ serverName: configuredServer, toolMeta: fallbackMatches[0]! });
+    }
+    const lazyMatches = lazyExactMatches.length > 0 ? lazyExactMatches : lazyFallbackMatches;
+    if (lazyMatches.length > 1) return ambiguousToolResult("call", toolName);
+    if (lazyMatches.length === 1) {
+      serverName = lazyMatches[0]!.serverName;
+      toolMeta = lazyMatches[0]!.toolMeta;
     }
   }
 
@@ -1025,7 +1106,9 @@ export async function executeCall(
       notifyToolMetadataUpdated(state, serverName, "proxy-call-reconnect");
       markKeepAliveAfterConnect(state, serverName);
       updateStatusBar(state);
-      toolMeta = findToolByName(state.toolMetadata.get(serverName), toolName);
+      const match = getSingleToolMatch(state.toolMetadata.get(serverName), toolName);
+      if (match === "ambiguous") return ambiguousToolResult("call", toolName);
+      toolMeta = match;
       if (!toolMeta) {
         const available = getToolNames(state, serverName);
         const hint = available.length > 0
@@ -1112,7 +1195,7 @@ export async function executeCall(
     state.manager.incrementInFlight(serverName);
 
     if (toolMeta.resourceUri) {
-      const result = await withSessionRecovery(
+      const result = await withSessionRecovery<ClientReadResourceResult>(
         {
           manager: state.manager,
           config: state.config,
@@ -1122,10 +1205,7 @@ export async function executeCall(
         serverName,
         (conn) => conn.client.readResource({ uri: toolMeta.resourceUri! }, requestOptions),
       );
-      const content = (result.contents ?? []).map(c => ({
-        type: "text" as const,
-        text: "text" in c ? c.text : ("blob" in c ? `[Binary data: ${(c as { mimeType?: string }).mimeType ?? "unknown"}]` : JSON.stringify(c)),
-      }));
+      const content = transformMcpResourceContents(result.contents ?? [], state.owner?.signal);
       const guarded = await guardMcpOutput(content.length > 0 ? content : [{ type: "text" as const, text: "(empty resource)" }], outputGuardOptions);
       return {
         content: guarded.content,
@@ -1165,7 +1245,7 @@ export async function executeCall(
 
       if (result.isError) {
         const mcpContent = (result.content ?? []) as McpContent[];
-        const content = transformMcpContent(mcpContent);
+        const content = transformMcpContent(mcpContent, state.owner?.signal);
         const outputContent = content.length > 0 ? content : [{ type: "text" as const, text: "(empty result)" }];
         const schemaText = toolMeta.inputSchema ? `\n\nExpected parameters:\n${formatSchema(toolMeta.inputSchema)}` : "";
         const guarded = await guardMcpOutput(outputContent, { ...outputGuardOptions, prefix: "Error: ", suffix: schemaText, emptyTextFallback: "Tool execution failed", rawMcpResult: result });
@@ -1175,7 +1255,7 @@ export async function executeCall(
         };
       }
 
-      const content = resolveMcpResultContent(result as Record<string, unknown>);
+      const content = resolveMcpResultContent(result as Record<string, unknown>, state.owner?.signal);
       const outputContent = content.length > 0 ? content : [{ type: "text" as const, text: "(empty result)" }];
       const uiSummary = summarizeUiSessionResult(uiSession);
       const guarded = await guardMcpOutput(outputContent, { ...outputGuardOptions, suffix: `\n\n${uiSummary.message}`, rawMcpResult: result });
@@ -1194,7 +1274,7 @@ export async function executeCall(
 
     if (result.isError) {
       const mcpContent = (result.content ?? []) as McpContent[];
-      const content = transformMcpContent(mcpContent);
+      const content = transformMcpContent(mcpContent, state.owner?.signal);
       const outputContent = content.length > 0 ? content : [{ type: "text" as const, text: "(empty result)" }];
       const schemaText = toolMeta.inputSchema ? `\n\nExpected parameters:\n${formatSchema(toolMeta.inputSchema)}` : "";
       const guarded = await guardMcpOutput(outputContent, { ...outputGuardOptions, prefix: "Error: ", suffix: schemaText, emptyTextFallback: "Tool execution failed", rawMcpResult: result });
@@ -1204,7 +1284,7 @@ export async function executeCall(
       };
     }
 
-    const content = resolveMcpResultContent(result as Record<string, unknown>);
+    const content = resolveMcpResultContent(result as Record<string, unknown>, state.owner?.signal);
     const outputContent = content.length > 0 ? content : [{ type: "text" as const, text: "(empty result)" }];
     const guarded = await guardMcpOutput(outputContent, { ...outputGuardOptions, rawMcpResult: result });
     return {

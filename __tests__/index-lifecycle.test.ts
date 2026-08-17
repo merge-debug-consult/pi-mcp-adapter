@@ -224,6 +224,51 @@ describe("mcpAdapter session lifecycle", () => {
     }));
   });
 
+  it("uses compact self-rendered rows for proxy and direct tools by default", async () => {
+    mocks.loadMcpConfig.mockReturnValue({
+      mcpServers: {
+        demo: { command: "npx", args: ["-y", "demo-server"], directTools: true },
+      },
+    });
+    mocks.resolveDirectTools.mockReturnValue([
+      {
+        serverName: "demo",
+        originalName: "search",
+        prefixedName: "demo_search",
+        description: "Search demo",
+      },
+    ]);
+
+    const { default: mcpAdapter } = await import("../index.ts");
+    const { api } = createPi();
+    mcpAdapter(api);
+
+    expect(api.registerTool).toHaveBeenCalledWith(expect.objectContaining({
+      name: "demo_search",
+      renderShell: "self",
+    }));
+    expect(api.registerTool).toHaveBeenCalledWith(expect.objectContaining({
+      name: "mcp",
+      renderShell: "self",
+    }));
+  });
+
+  it("keeps legacy boxed rows when configured", async () => {
+    mocks.loadMcpConfig.mockReturnValue({
+      settings: { toolResultRendering: "boxed" },
+      mcpServers: {},
+    });
+
+    const { default: mcpAdapter } = await import("../index.ts");
+    const { api } = createPi();
+    mcpAdapter(api);
+
+    expect(api.registerTool).toHaveBeenCalledWith(expect.objectContaining({
+      name: "mcp",
+      renderShell: "default",
+    }));
+  });
+
   it("does not leak TypeBox internal markers into registered tool parameter schemas", async () => {
     const { default: mcpAdapter } = await import("../index.ts");
     const { api } = createPi();
@@ -570,6 +615,57 @@ describe("mcpAdapter session lifecycle", () => {
     );
   });
 
+  it("dispatches gateway params nested inside proxy args", async () => {
+    const state = createState();
+    mocks.initializeMcp.mockResolvedValue(state);
+    mocks.executeCall.mockResolvedValue({ content: [{ type: "text", text: "ok" }] });
+    mocks.executeSearch.mockResolvedValue({ content: [{ type: "text", text: "results" }] });
+
+    const { default: mcpAdapter } = await import("../index.ts");
+    const { api, handlers } = createPi();
+    mcpAdapter(api);
+
+    const sessionStart = handlers.get("session_start");
+    await sessionStart?.({}, {});
+    await Promise.resolve();
+    await Promise.resolve();
+
+    const proxyTool = api.registerTool.mock.calls.find((call: any[]) => call[0].name === "mcp")?.[0];
+    await proxyTool.execute("call-1", { args: '{"search":"screenshot","limit":3}' });
+    await proxyTool.execute("call-2", { args: { tool: "demo_search", args: { q: "hello" }, server: "demo" } });
+
+    expect(mocks.executeSearch).toHaveBeenCalledWith(state, "screenshot", undefined, undefined, undefined, 3, undefined);
+    expect(mocks.executeCall).toHaveBeenCalledWith(
+      state,
+      "demo_search",
+      { q: "hello" },
+      "demo",
+      expect.any(Function),
+      undefined,
+    );
+    expect(mocks.executeStatus).not.toHaveBeenCalled();
+  });
+
+  it("rejects non-gateway params nested inside proxy args", async () => {
+    const state = createState();
+    mocks.initializeMcp.mockResolvedValue(state);
+
+    const { default: mcpAdapter } = await import("../index.ts");
+    const { api, handlers } = createPi();
+    mcpAdapter(api);
+
+    const sessionStart = handlers.get("session_start");
+    await sessionStart?.({}, {});
+    await Promise.resolve();
+    await Promise.resolve();
+
+    const proxyTool = api.registerTool.mock.calls.find((call: any[]) => call[0].name === "mcp")?.[0];
+    await expect(proxyTool.execute("call-1", { args: '{"query":"screenshot"}' })).rejects.toThrow(
+      "Gateway params were nested inside `args`; pass them top-level",
+    );
+    expect(mocks.executeStatus).not.toHaveBeenCalled();
+  });
+
   it("routes manual auth actions through the proxy tool", async () => {
     const state = createState();
     mocks.initializeMcp.mockResolvedValue(state);
@@ -820,6 +916,36 @@ describe("mcpAdapter session lifecycle", () => {
 
     await proxyTool.execute("call-1", {});
     expect(mocks.executeStatus).toHaveBeenCalledWith(state);
+  });
+
+  it("does not fail load-time tool sync before Pi action methods are bound", async () => {
+    mocks.loadMcpConfig.mockReturnValue({
+      mcpServers: {
+        demo: { url: "http://localhost:3999/mcp", lifecycle: "eager" },
+      },
+    });
+    const state = createState();
+    mocks.initializeMcp.mockResolvedValue(state);
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    try {
+      const { default: mcpAdapter } = await import("../index.ts");
+      const { api } = createPi();
+      api.getActiveTools.mockImplementation(() => {
+        throw new Error("Extension runtime not initialized. Action methods cannot be called during extension loading.");
+      });
+      mcpAdapter(api);
+
+      await new Promise((resolve) => setImmediate(resolve));
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect(mocks.initializeMcp).toHaveBeenCalledTimes(1);
+      expect(mocks.updateStatusBar).toHaveBeenCalledWith(state);
+      expect(consoleError).not.toHaveBeenCalled();
+    } finally {
+      consoleError.mockRestore();
+    }
   });
 
   it("does not initialize at load when startup servers are absent or disabled", async () => {

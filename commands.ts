@@ -12,7 +12,6 @@ import {
   previewSharedServerEntry,
   previewStarterProjectConfig,
   writeDirectToolsConfig,
-  writeProjectServerDisabledOverride,
   writeSharedServerEntry,
   writeStarterProjectConfig,
 } from "./config.ts";
@@ -24,6 +23,10 @@ import { getAuthStorageOptions, inspectAuthForUrl } from "./mcp-auth.ts";
 import { loadOnboardingState, markSetupCompleted as persistSetupCompleted, markSharedConfigHintShown } from "./onboarding-state.ts";
 import { openPath, resolveServerUrl, sanitizeTerminalText } from "./utils.ts";
 import { isAbortError } from "./runtime-owner.ts";
+
+function terminalHyperlink(label: string, url: string): string {
+  return `\u001B]8;;${sanitizeTerminalText(url)}\u001B\\${sanitizeTerminalText(label)}\u001B]8;;\u001B\\`;
+}
 
 export async function showStatus(state: McpExtensionState, ctx: ExtensionContext): Promise<void> {
   if (!ctx.hasUI) return;
@@ -166,7 +169,7 @@ export async function reconnectServer(
     }
 
     const prefix = state.config.settings?.toolPrefix ?? "server";
-    const { metadata, failedTools } = buildToolMetadata(connection.tools, connection.resources, definition, name, prefix);
+    const { metadata, failedTools } = buildToolMetadata(connection.tools, connection.resources, definition, name, prefix, state.config.mcpServers, state.toolMetadata);
     state.toolMetadata.set(name, metadata);
     if (!connection.promptDiscoveryFailed) {
       state.promptMetadata?.set(name, reconstructPromptMetadata(name, connection.prompts ?? [], prefix, definition));
@@ -273,9 +276,24 @@ export async function authenticateServer(
       ...(authStorageOptions.baseDir ? { authStorageOptions } : {}),
       onAuthorizationUrl: (authorizationUrl) => {
         ui.notify(
-          `Open this URL to authenticate ${serverName}:\n\n${authorizationUrl}\n\n` +
-          "After approving, return to Pi; the local callback will complete automatically.",
+          `Open this URL to authenticate ${serverName}:\n\n${terminalHyperlink(authorizationUrl, authorizationUrl)}\n\n` +
+          "After approving, Pi will complete automatically if the browser can reach its localhost callback. " +
+          "On a remote machine, copy the full localhost URL from the browser address bar and paste it into Pi.",
           "info"
+        );
+      },
+      onAuthorizationInput: async (authorizationUrl, inputSignal) => {
+        const readyToPaste = await ui.confirm(
+          `Authorize ${serverName}`,
+          `Open this link in your browser:\n${terminalHyperlink(authorizationUrl, authorizationUrl)}\n\n` +
+          "After approving access, select Yes to paste the callback URL.",
+          { signal: inputSignal },
+        );
+        if (!readyToPaste || inputSignal.aborted) return undefined;
+        return ui.input(
+          `Complete ${serverName} OAuth`,
+          "Paste the full callback URL",
+          { signal: inputSignal },
         );
       },
       ...(signal ? { signal } : {}),
